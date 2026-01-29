@@ -1,3 +1,9 @@
+// MicrometerLogger
+// Author: J Taylor
+// Supplied without warranty.
+// Use at your own risk.
+
+
 // src/main.rs
 //
 // Serial data logger + plotter UI for an optical micrometer (generic).
