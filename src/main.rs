@@ -12,6 +12,8 @@
 // serialport, chrono, plotters, plotters-iced, iced (canvas,tokio,advanced), rfd,
 // dirs, serde (derive), serde_json
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use serialport::SerialPort;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
