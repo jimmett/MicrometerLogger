@@ -46,7 +46,6 @@ enum Message {
     Quit,
     SetUcl(String),
     SetLcl(String),
-    SavePlot,
     ExportCsv,
     RefreshPorts,
     PortSelected(PortEntry),
@@ -211,7 +210,7 @@ struct MicrometerLoggerApp {
 
     // data
     measurements: Vec<(f32, f32)>,        // rolling points for plot (elapsed_s, value)
-    all_measurements: Vec<(String, f32)>, // full session for export (timestamp, value)
+    all_measurements: Vec<(String, f32, f32)>, // full session for export (timestamp, value, elapsed_secs)
     start_time: SystemTime,
     logging: bool,
 
@@ -273,7 +272,7 @@ impl Default for MicrometerLoggerApp {
             ucl_input: "6.5".to_string(),
             lcl_input: "6.0".to_string(),
 
-            port_name: "COM6".to_string(),
+            port_name: String::new(),
             baud_rate: 9600,
             data_bits: DataBitsOpt::Eight,
             parity: ParityOpt::None,
@@ -446,7 +445,7 @@ impl MicrometerLoggerApp {
         let prefix = self.make_prefix();
         let log_path = Self::log_dir().join(format!("{}measurements_{}.csv", prefix, timestamp));
 
-        let mut file = OpenOptions::new().write(true).create(true).open(&log_path)?;
+        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&log_path)?;
         writeln!(file, "Timestamp,Measurement")?;
         self.file = Some(file);
         Ok(())
@@ -591,68 +590,122 @@ impl MicrometerLoggerApp {
         self.serial_paused = true;
     }
 
-    fn save_plot(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn save_summary_plot(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.all_measurements.is_empty() {
+            return Ok(());
+        }
+
         fs::create_dir_all(Self::log_dir())?;
 
         let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
         let prefix = self.make_prefix();
-        let plot_path = Self::log_dir().join(format!("{}plot_{}.png", prefix, timestamp));
+        let plot_path = Self::log_dir().join(format!("{}summary_{}.png", prefix, timestamp));
+        let plot_path_str = plot_path.to_string_lossy().to_string();
 
-        let plot_path_str = plot_path.to_string_lossy();
-        let root = BitMapBackend::new(plot_path_str.as_ref(), (800, 400)).into_drawing_area();
-        root.fill(&WHITE)?;
+        // Collect values and elapsed times
+        let all_values: Vec<f64> = self.all_measurements.iter().map(|&(_, v, _)| v as f64).collect();
+        let all_times: Vec<f64> = self.all_measurements.iter().map(|&(_, _, t)| t as f64).collect();
+        let count = all_values.len();
 
-        let (base_t, max_time) = if self.measurements.len() >= 2 {
-            let base = self.measurements.first().unwrap().0;
-            let span = self.measurements.last().unwrap().0 - base;
-            (base, span.max(1.0))
+        // Decimate if > 2000 points
+        let (times, values): (Vec<f64>, Vec<f64>) = if count > 2000 {
+            let step = count as f64 / 1000.0;
+            (0..1000)
+                .map(|i| {
+                    let idx = (i as f64 * step) as usize;
+                    (all_times[idx], all_values[idx])
+                })
+                .unzip()
         } else {
-            (0.0f32, 60.0f32)
+            (all_times.clone(), all_values.clone())
         };
 
+        // Statistics from ALL data (not decimated)
+        let mean = all_values.iter().sum::<f64>() / count as f64;
+        let variance = all_values.iter().map(|&x| (x - mean).powi(2)).sum::<f64>()
+            / (count - 1).max(1) as f64;
+        let sd = variance.sqrt();
+        let data_min = all_values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let data_max = all_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let ucl = self.ucl as f64;
+        let lcl = self.lcl as f64;
+
+        // Y range
+        let margin = 2.0_f64;
+        let y_min = (lcl - margin).min(data_min - 0.5);
+        let y_max = (ucl + margin).max(data_max + 0.5);
+
+        let x_max = *times.last().unwrap_or(&60.0);
+        let x_max = x_max.max(1.0);
+
+        let root = BitMapBackend::new(&plot_path_str, (800, 400)).into_drawing_area();
+        root.fill(&WHITE)?;
+
         let mut chart = ChartBuilder::on(&root)
-            .caption(
-                "Optical Micrometer Measurements (Last 300)",
-                ("sans-serif", 20).into_font(),
-            )
+            .caption("Roll Summary", ("sans-serif", 20).into_font())
             .margin(10)
             .x_label_area_size(40)
             .y_label_area_size(70)
-            .build_cartesian_2d(0f64..max_time as f64, 2f64..10f64)?;
+            .build_cartesian_2d(0f64..x_max, y_min..y_max)?;
 
         chart
             .configure_mesh()
             .x_desc("Time (s)")
-            .y_desc("")
+            .y_desc("Measurement (mm)")
             .axis_desc_style(("sans-serif", 15))
             .draw()?;
 
-        // Saved plot: vertical label in margin
-        let y_style: TextStyle = TextStyle::from(("sans-serif", 15).into_font())
-            .transform(FontTransform::Rotate90);
-        root.draw_text("Measurement (mm)", &y_style, (18, 200))?;
+        // Data series
+        chart.draw_series(LineSeries::new(
+            times.iter().zip(values.iter()).map(|(&t, &v)| (t, v)),
+            &BLUE,
+        ))?;
 
-        if !self.measurements.is_empty() {
-            chart.draw_series(LineSeries::new(
-                self.measurements
-                    .iter()
-                    .map(|&(t, v)| ((t - base_t) as f64, v as f64)),
-                &BLUE,
-            ))?;
+        // UCL / LCL
+        let thin_red = ShapeStyle::from(&RED).stroke_width(1);
+        chart.draw_series(LineSeries::new(vec![(0f64, ucl), (x_max, ucl)], thin_red))?;
+        chart.draw_series(LineSeries::new(vec![(0f64, lcl), (x_max, lcl)], thin_red))?;
+
+        // Mean line (green)
+        let green_style = ShapeStyle::from(&GREEN).stroke_width(2);
+        chart.draw_series(LineSeries::new(vec![(0f64, mean), (x_max, mean)], green_style))?;
+
+        if sd > 0.0 {
+            // σ lines
+            let cyan = RGBColor(0, 180, 180);
+            let magenta = RGBColor(180, 0, 180);
+            let orange = RGBColor(200, 120, 0);
+
+            for &(mult, color) in &[(1.0, &cyan), (2.0, &magenta), (3.0, &orange)] {
+                let style = ShapeStyle::from(color).stroke_width(1);
+                chart.draw_series(DashedLineSeries::new(
+                    vec![(0f64, mean + mult * sd), (x_max, mean + mult * sd)], 5, 3, style,
+                ))?;
+                chart.draw_series(DashedLineSeries::new(
+                    vec![(0f64, mean - mult * sd), (x_max, mean - mult * sd)], 5, 3, style,
+                ))?;
+            }
+
+            // Cp / Cpk
+            let cp = (ucl - lcl) / (6.0 * sd);
+            let cpk = ((ucl - mean) / (3.0 * sd)).min((mean - lcl) / (3.0 * sd));
+
+            // Text annotations (top-right area)
+            let annotation = format!(
+                "n={}  Mean={:.3}  SD={:.4}\nMin={:.3}  Max={:.3}\nCp={:.2}  Cpk={:.2}",
+                count, mean, sd, data_min, data_max, cp, cpk
+            );
+            let text_style = TextStyle::from(("sans-serif", 12).into_font()).color(&BLACK);
+            let text_x = x_max * 0.55;
+            let text_y = y_max - (y_max - y_min) * 0.05;
+            chart.draw_series(std::iter::once(Text::new(
+                annotation, (text_x, text_y), text_style,
+            )))?;
         }
 
-        let thin_red = ShapeStyle::from(&RED).stroke_width(1);
-        chart.draw_series(LineSeries::new(
-            vec![(0f64, self.ucl as f64), (max_time as f64, self.ucl as f64)],
-            thin_red,
-        ))?;
-        chart.draw_series(LineSeries::new(
-            vec![(0f64, self.lcl as f64), (max_time as f64, self.lcl as f64)],
-            thin_red,
-        ))?;
-
         root.present()?;
-        println!("Plot saved to {}", plot_path.display());
+        println!("Summary plot saved to {}", plot_path.display());
         Ok(())
     }
 
@@ -672,7 +725,7 @@ impl MicrometerLoggerApp {
                 .open(&path)?;
 
             writeln!(out, "Timestamp,Measurement")?;
-            for (ts, m) in &self.all_measurements {
+            for (ts, m, _) in &self.all_measurements {
                 writeln!(out, "{},{}", ts, m)?;
             }
             out.flush()?;
@@ -722,7 +775,7 @@ impl MicrometerLoggerApp {
                     .unwrap_or(Duration::from_secs(0));
                 let elapsed_secs = elapsed.as_secs_f32();
 
-                self.all_measurements.push((timestamp, m));
+                self.all_measurements.push((timestamp, m, elapsed_secs));
 
                 if self.measurements.len() >= self.max_display_points {
                     self.measurements.remove(0);
@@ -834,10 +887,10 @@ impl MicrometerLoggerApp {
             self.no_data_reason = Some("PAUSED".to_string());
         } else {
             // RESUME
-            if let Some(t0) = self.paused_at.take() {
-                if let Ok(dt) = now.duration_since(t0) {
-                    self.paused_total += dt;
-                }
+            if let Some(t0) = self.paused_at.take()
+                && let Ok(dt) = now.duration_since(t0)
+            {
+                self.paused_total += dt;
             }
             self.logging = true;
             self.no_data_reason = None;
@@ -856,9 +909,9 @@ impl MicrometerLoggerApp {
         // Close file cleanly
         self.file = None;
 
-        // Save snapshot plot (optional but useful)
-        if let Err(e) = self.save_plot() {
-            self.error = Some(format!("Save plot failed: {e}"));
+        // Generate end-of-roll summary plot
+        if let Err(e) = self.save_summary_plot() {
+            self.error = Some(format!("Summary plot failed: {e}"));
         }
 
         // Reset session buffers ready for next roll
@@ -956,7 +1009,6 @@ impl MicrometerLoggerApp {
                 let _ = self.save_settings_to_disk();
                 self.stop_serial_thread();
                 self.file = None;
-                let _ = self.save_plot();
                 return iced::exit::<Message>();
             }
 
@@ -973,12 +1025,6 @@ impl MicrometerLoggerApp {
                 if let Ok(v) = input.parse::<f32>() {
                     self.lcl = v;
                     let _ = self.save_settings_to_disk();
-                }
-            }
-
-            Message::SavePlot => {
-                if let Err(e) = self.save_plot() {
-                    self.error = Some(format!("Save plot failed: {e}"));
                 }
             }
 
@@ -1146,7 +1192,7 @@ impl MicrometerLoggerApp {
                 self.selected_port.clone(),
                 Message::PortSelected,
             )
-                .width(Length::Fixed(420.0))
+                .width(Length::Fill)
                 .into()
         };
 
@@ -1186,8 +1232,8 @@ impl MicrometerLoggerApp {
         let can_connect = self.port.is_none();
         let can_disconnect = self.port.is_some();
         let can_start_new_roll = self.port.is_some(); // always allowed when connected
-        let can_pause_resume = self.port.is_some();
-        let can_end_roll = self.port.is_some(); // and/or self.file.is_some()
+        let can_pause_resume = self.port.is_some() && self.file.is_some();
+        let can_end_roll = self.port.is_some() && self.file.is_some();
 
         let controls = column![
             row![text("Logging:"), logging_dot, text("   Serial:"), serial_dot]
@@ -1221,7 +1267,6 @@ impl MicrometerLoggerApp {
                 action_button("Start New Roll", can_start_new_roll, Message::StartLogging),
                 action_button(pause_label, can_pause_resume, Message::PauseLogging),
                 action_button("End Roll", can_end_roll, Message::EndRoll),
-                button("Save Plot").on_press(Message::SavePlot),
                 button("Export CSV").on_press(Message::ExportCsv),
                 button("Quit").on_press(Message::Quit),
             ]
@@ -1255,15 +1300,24 @@ impl MicrometerLoggerApp {
 
         let mut content = column![controls].align_x(Alignment::Center).spacing(10);
 
+        let mean = if !self.measurements.is_empty() {
+            let sum: f64 = self.measurements.iter().map(|&(_, v)| v as f64).sum();
+            Some(sum / self.measurements.len() as f64)
+        } else {
+            None
+        };
+
         let chart = MyChart {
             measurements: &self.measurements,
             ucl: self.ucl,
             lcl: self.lcl,
+            mean,
+            std_dev: self.std_dev,
         };
 
         let plot: Element<Message> = ChartWidget::new(chart)
-            .width(Length::Fixed(800.0))
-            .height(Length::Fixed(400.0))
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into();
 
         content = content.push(plot);
@@ -1294,6 +1348,8 @@ struct MyChart<'a> {
     measurements: &'a Vec<(f32, f32)>,
     ucl: f32,
     lcl: f32,
+    mean: Option<f64>,
+    std_dev: Option<f64>,
 }
 
 impl<'a> Chart<Message> for MyChart<'a> {
@@ -1312,12 +1368,23 @@ impl<'a> Chart<Message> for MyChart<'a> {
             (0.0f32, 60.0f32)
         };
 
+        // Dynamic Y-axis: start from UCL/LCL with 2mm padding, expand for data
+        let margin = 2.0_f64;
+        let mut y_min = (self.lcl as f64) - margin;
+        let mut y_max = (self.ucl as f64) + margin;
+        if !self.measurements.is_empty() {
+            let data_min = self.measurements.iter().map(|&(_, v)| v as f64).fold(f64::INFINITY, f64::min);
+            let data_max = self.measurements.iter().map(|&(_, v)| v as f64).fold(f64::NEG_INFINITY, f64::max);
+            y_min = y_min.min(data_min - 0.5);
+            y_max = y_max.max(data_max + 0.5);
+        }
+
         let mut chart = builder
             .caption("Optical Micrometer Measurements (Last 300)", ("sans-serif", 20))
             .margin(10)
             .set_label_area_size(LabelAreaPosition::Left, 70)
             .set_label_area_size(LabelAreaPosition::Bottom, 40)
-            .build_cartesian_2d(0f64..max_time as f64, 2f64..10f64)
+            .build_cartesian_2d(0f64..max_time as f64, y_min..y_max)
             .expect("Failed to build chart");
 
         chart
@@ -1328,6 +1395,7 @@ impl<'a> Chart<Message> for MyChart<'a> {
             .draw()
             .expect("Failed to draw mesh");
 
+        // Data series
         if !self.measurements.is_empty() {
             chart
                 .draw_series(LineSeries::new(
@@ -1339,15 +1407,14 @@ impl<'a> Chart<Message> for MyChart<'a> {
                 .expect("Failed to draw series");
         }
 
+        // UCL / LCL lines (red)
         let thin_red = ShapeStyle::from(&RED).stroke_width(1);
-
         chart
             .draw_series(LineSeries::new(
                 vec![(0f64, self.ucl as f64), (max_time as f64, self.ucl as f64)],
                 thin_red,
             ))
             .expect("Failed to draw UCL");
-
         chart
             .draw_series(LineSeries::new(
                 vec![(0f64, self.lcl as f64), (max_time as f64, self.lcl as f64)],
@@ -1355,14 +1422,77 @@ impl<'a> Chart<Message> for MyChart<'a> {
             ))
             .expect("Failed to draw LCL");
 
-        // Vertical label inside plot area (plotters_iced doesn't expose margin area)
+        // SPC lines: mean, ±1σ, ±2σ, ±3σ
+        if let (Some(mean), Some(sd)) = (self.mean, self.std_dev)
+            && sd > 0.0
+        {
+            let x0 = 0f64;
+            let x1 = max_time as f64;
+
+            // Mean line (green, solid)
+            let green_style = ShapeStyle::from(&GREEN).stroke_width(2);
+            let _ = chart.draw_series(LineSeries::new(
+                vec![(x0, mean), (x1, mean)],
+                green_style,
+            ));
+
+            // ±1σ (cyan, dashed)
+            let cyan = RGBColor(0, 180, 180);
+            let _ = chart.draw_series(DashedLineSeries::new(
+                vec![(x0, mean + sd), (x1, mean + sd)], 5, 3,
+                ShapeStyle::from(&cyan).stroke_width(1),
+            ));
+            let _ = chart.draw_series(DashedLineSeries::new(
+                vec![(x0, mean - sd), (x1, mean - sd)], 5, 3,
+                ShapeStyle::from(&cyan).stroke_width(1),
+            ));
+
+            // ±2σ (magenta)
+            let magenta = RGBColor(180, 0, 180);
+            let _ = chart.draw_series(DashedLineSeries::new(
+                vec![(x0, mean + 2.0 * sd), (x1, mean + 2.0 * sd)], 5, 3,
+                ShapeStyle::from(&magenta).stroke_width(1),
+            ));
+            let _ = chart.draw_series(DashedLineSeries::new(
+                vec![(x0, mean - 2.0 * sd), (x1, mean - 2.0 * sd)], 5, 3,
+                ShapeStyle::from(&magenta).stroke_width(1),
+            ));
+
+            // ±3σ (orange)
+            let orange = RGBColor(200, 120, 0);
+            let _ = chart.draw_series(DashedLineSeries::new(
+                vec![(x0, mean + 3.0 * sd), (x1, mean + 3.0 * sd)], 5, 3,
+                ShapeStyle::from(&orange).stroke_width(1),
+            ));
+            let _ = chart.draw_series(DashedLineSeries::new(
+                vec![(x0, mean - 3.0 * sd), (x1, mean - 3.0 * sd)], 5, 3,
+                ShapeStyle::from(&orange).stroke_width(1),
+            ));
+
+            // Cp and Cpk text annotation
+            let ucl = self.ucl as f64;
+            let lcl = self.lcl as f64;
+            let cp = (ucl - lcl) / (6.0 * sd);
+            let cpk = ((ucl - mean) / (3.0 * sd)).min((mean - lcl) / (3.0 * sd));
+            let annotation = format!("Cp={:.2}  Cpk={:.2}", cp, cpk);
+            let text_style = TextStyle::from(("sans-serif", 13).into_font())
+                .color(&BLACK);
+            let text_x = max_time as f64 * 0.60;
+            let text_y = y_max - (y_max - y_min) * 0.05;
+            let _ = chart.draw_series(std::iter::once(Text::new(
+                annotation, (text_x, text_y), text_style,
+            )));
+        }
+
+        // Vertical label inside plot area
         let y_style: TextStyle = TextStyle::from(("sans-serif", 13).into_font())
             .transform(FontTransform::Rotate90);
-        let label_pos: (f64, f64) = (1.2, 9.0);
+        let label_x = max_time as f64 * 0.02;
+        let label_y = y_min + (y_max - y_min) * 0.85;
 
         let _ = chart.draw_series(std::iter::once(Text::new(
             "Measurement (mm)",
-            label_pos,
+            (label_x, label_y),
             y_style,
         )));
     }
@@ -1377,7 +1507,8 @@ fn main() -> iced::Result {
         .subscription(MicrometerLoggerApp::subscription)
         .window(iced::window::Settings {
             size: Size::new(1020.0, 790.0),
-            resizable: false,
+            resizable: true,
+            min_size: Some(Size::new(800.0, 600.0)),
             ..Default::default()
         })
         .antialiasing(true)
