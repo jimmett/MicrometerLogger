@@ -232,6 +232,7 @@ struct MicrometerLoggerApp {
     stop_bits: StopBitsOpt,
     max_display_points: usize,
     label_prefix: String,
+    sample_interval_ms: u64,
 
     // stats / ui
     current_measurement: Option<f32>,
@@ -280,6 +281,7 @@ impl Default for MicrometerLoggerApp {
 
             max_display_points: 300,
             label_prefix: String::new(),
+            sample_interval_ms: 100,
 
             current_measurement: None,
             std_dev: None,
@@ -351,7 +353,11 @@ impl MicrometerLoggerApp {
         self.ucl_input = format!("{}", self.ucl);
         self.lcl_input = format!("{}", self.lcl);
 
-        self.label_prefix = cfg.label_prefix;
+        self.label_prefix = cfg
+            .label_prefix
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_' || *c == '.')
+            .collect();
 
         Ok(())
     }
@@ -475,24 +481,31 @@ impl MicrometerLoggerApp {
             }
         };
 
+        let initial_interval = self.sample_interval_ms;
+
         thread::spawn(move || {
             let mut paused = true;
             let mut port = port;
+            let interval_ms = initial_interval;
 
             loop {
-                match cmd_rx.try_recv() {
-                    Ok(SerialCmd::Pause(p)) => paused = p,
-                    Ok(SerialCmd::Stop) => break,
-                    Err(TryRecvError::Empty) => {}
-                    Err(TryRecvError::Disconnected) => break,
+                // Drain all pending commands
+                loop {
+                    match cmd_rx.try_recv() {
+                        Ok(SerialCmd::Pause(p)) => paused = p,
+                        Ok(SerialCmd::Stop) => return,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
                 }
 
                 if paused {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(50));
                     continue;
                 }
 
-                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let cycle_start = std::time::Instant::now();
+                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
 
                 // NOTE: This request string is device/protocol-specific.
                 // Keep/adjust it to match your micrometer's serial protocol.
@@ -502,17 +515,24 @@ impl MicrometerLoggerApp {
                         "{}: Failed to write command: {}",
                         timestamp, e
                     )));
-                    thread::sleep(Duration::from_millis(150));
+                    thread::sleep(Duration::from_millis(interval_ms));
                     continue;
                 }
                 let _ = port.flush();
 
-                thread::sleep(Duration::from_millis(75));
+                // Wait for device to respond — use half the interval or 75ms, whichever is smaller
+                let read_wait = (interval_ms / 2).min(75);
+                thread::sleep(Duration::from_millis(read_wait));
 
                 let mut buffer = [0u8; 1024];
                 let bytes_read = match port.read(&mut buffer) {
                     Ok(0) => {
-                        thread::sleep(Duration::from_millis(50));
+                        // Sleep the remainder of the interval
+                        let elapsed = cycle_start.elapsed();
+                        let target = Duration::from_millis(interval_ms);
+                        if let Some(remaining) = target.checked_sub(elapsed) {
+                            thread::sleep(remaining);
+                        }
                         continue;
                     }
                     Ok(n) => n,
@@ -521,7 +541,7 @@ impl MicrometerLoggerApp {
                             "{}: Read error: {}",
                             timestamp, e
                         )));
-                        thread::sleep(Duration::from_millis(150));
+                        thread::sleep(Duration::from_millis(interval_ms));
                         continue;
                     }
                 };
@@ -536,30 +556,40 @@ impl MicrometerLoggerApp {
 
                         if measurement1.contains("--") || measurement2.contains("--") {
                             let _ = data_tx.send(SerialMessage::Invalid(response, timestamp));
-                            continue;
-                        }
+                        } else {
+                            let m1: f32 = match measurement1.parse() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = data_tx.send(SerialMessage::Error(format!(
+                                        "{}: Failed to parse measurement1 '{}': {}",
+                                        timestamp, measurement1, e
+                                    )));
+                                    // fall through to interval sleep below
+                                    let elapsed = cycle_start.elapsed();
+                                    let target = Duration::from_millis(interval_ms);
+                                    if let Some(remaining) = target.checked_sub(elapsed) {
+                                        thread::sleep(remaining);
+                                    }
+                                    continue;
+                                }
+                            };
 
-                        let m1: f32 = match measurement1.parse() {
-                            Ok(v) => v,
-                            Err(e) => {
+                            // Validate m2 numeric but ignore it (duplicated in your case)
+                            if let Err(e) = measurement2.parse::<f32>() {
                                 let _ = data_tx.send(SerialMessage::Error(format!(
-                                    "{}: Failed to parse measurement1 '{}': {}",
-                                    timestamp, measurement1, e
+                                    "{}: Failed to parse measurement2 '{}': {}",
+                                    timestamp, measurement2, e
                                 )));
+                                let elapsed = cycle_start.elapsed();
+                                let target = Duration::from_millis(interval_ms);
+                                if let Some(remaining) = target.checked_sub(elapsed) {
+                                    thread::sleep(remaining);
+                                }
                                 continue;
                             }
-                        };
 
-                        // Validate m2 numeric but ignore it (duplicated in your case)
-                        if let Err(e) = measurement2.parse::<f32>() {
-                            let _ = data_tx.send(SerialMessage::Error(format!(
-                                "{}: Failed to parse measurement2 '{}': {}",
-                                timestamp, measurement2, e
-                            )));
-                            continue;
+                            let _ = data_tx.send(SerialMessage::Measurement(m1, timestamp));
                         }
-
-                        let _ = data_tx.send(SerialMessage::Measurement(m1, timestamp));
                     } else {
                         let _ = data_tx.send(SerialMessage::Invalid(response, timestamp));
                     }
@@ -570,7 +600,12 @@ impl MicrometerLoggerApp {
                     )));
                 }
 
-                thread::sleep(Duration::from_millis(50));
+                // Sleep the remainder of the interval to hit the target rate
+                let elapsed = cycle_start.elapsed();
+                let target = Duration::from_millis(interval_ms);
+                if let Some(remaining) = target.checked_sub(elapsed) {
+                    thread::sleep(remaining);
+                }
             }
         });
     }
@@ -581,6 +616,7 @@ impl MicrometerLoggerApp {
             let _ = tx.send(SerialCmd::Pause(paused));
         }
     }
+
 
     fn stop_serial_thread(&mut self) {
         if let Some(tx) = self.serial_cmd_tx.take() {
@@ -1043,7 +1079,18 @@ impl MicrometerLoggerApp {
             }
 
             Message::LabelPrefixChanged(prefix) => {
-                self.label_prefix = prefix;
+                // Strip filesystem-unsafe characters
+                let sanitised: String = prefix
+                    .chars()
+                    .filter(|c| {
+                        c.is_alphanumeric()
+                            || *c == ' '
+                            || *c == '-'
+                            || *c == '_'
+                            || *c == '.'
+                    })
+                    .collect();
+                self.label_prefix = sanitised;
                 let _ = self.save_settings_to_disk();
             }
 
@@ -1085,7 +1132,7 @@ impl MicrometerLoggerApp {
 
                 // Staleness watchdog (only while logging)
                 if self.logging {
-                    let stale_after = Duration::from_millis(900);
+                    let stale_after = Duration::from_millis(self.sample_interval_ms * 6);
                     let now = SystemTime::now();
 
                     let is_stale = self
@@ -1499,6 +1546,12 @@ impl<'a> Chart<Message> for MyChart<'a> {
 }
 
 fn main() -> iced::Result {
+    let icon = iced::window::icon::from_file_data(
+        include_bytes!("../assets/icon.png"),
+        None,
+    )
+        .ok();
+
     iced::application(
         MicrometerLoggerApp::title,
         MicrometerLoggerApp::update,
@@ -1509,6 +1562,7 @@ fn main() -> iced::Result {
             size: Size::new(1020.0, 790.0),
             resizable: true,
             min_size: Some(Size::new(800.0, 600.0)),
+            icon,
             ..Default::default()
         })
         .antialiasing(true)
