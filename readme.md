@@ -4,7 +4,7 @@ MicrometerLogger was written to fill a gap in available tooling for the **Keyenc
 
 While conceived around the LS-7001, it should work with any RS232 optical micrometer that uses the `M0,0\r` polling protocol.
 
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
 
 ---
@@ -90,6 +90,38 @@ To create a `.app` bundle with the correct icon for Finder/Dock:
 ### Windows
 
 The release build suppresses the console window automatically. The application icon is embedded into the `.exe` via `build.rs`.
+
+### Raspberry Pi 5 (Linux ARM64)
+
+Building natively on a Raspberry Pi 5 running Raspberry Pi OS (64-bit) is supported.
+
+**Install system dependencies:**
+
+```bash
+sudo apt install -y \
+  pkg-config \
+  libudev-dev \
+  libgtk-3-dev \
+  libxkbcommon-dev \
+  libwayland-dev \
+  libxcb-shape0-dev \
+  libxcb-xfixes0-dev
+```
+
+**Install Rust:**
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+```
+
+**Build:**
+
+```bash
+cargo build --release
+```
+
+The first build will take several minutes as Iced and its dependencies compile. Subsequent incremental builds are much faster. A connected display running X11 or Wayland is required to run the application.
 
 ---
 
